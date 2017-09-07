@@ -1,0 +1,11 @@
+{
+  "name": "fotno-module-xml-stats",
+  "description": "Generates some quantitative statistics about an XML codebase.",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "fontoxpath": "2.3.1",
+    "globby": "^6.1.0",
+    "xmldom": "^0.1.27"
+  }
+}
