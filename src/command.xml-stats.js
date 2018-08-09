@@ -4,6 +4,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const globby = require('globby');
+const Table = require('@fontoxml/fontoxml-development-tools-module-core').TableCommand;
 
 const fontoxpath = require('fontoxpath');
 const DOMParser = require('xmldom').DOMParser,
@@ -15,7 +16,99 @@ function percentage (ratio) {
 	return (Math.round(ratio * 10000) / 100) + '%';
 }
 
+function getDomsForRequest (req, res) {
+	const fileList = [
+		...req.options.files,
+		...(req.options.glob ? globby.sync([req.options.glob], { cwd: process.cwd(), absolute: true }) : [])
+	];
+	const destroy = res.spinner('Reading ' + fileList.length + ' files');
+	// Read all files
+	return (function readNextBatch (fileList, accum = []) {
+		const slice = fileList.length > 100 ? fileList.slice(0, 100) : fileList;
+		const nextSlice = fileList.length > 100 ? fileList.slice(100) : [];
+
+		return Promise.all(slice.map(filename => {
+			return new Promise((resolve, reject) => fs.readFile(filename, 'utf8', (err, data) => {
+				if (err) {
+					res.notice(filename + ' could not be read: ' + err.message);
+					return resolve(false);
+				}
+				resolve(data);
+			}))
+		}))
+			.then(contents => {
+				const elegible = contents.filter(c => !!c);
+				return elegible.map(content => {
+					try {
+						return domParser.parseFromString(content, 'application/xml');
+					} catch(err) {
+						res.notice(filename + ' could not be parsed: ' + err.message);
+						return false;
+					}
+				})
+			})
+			.then(doms => {
+				if (nextSlice.length) {
+					return readNextBatch(nextSlice, accum.concat(doms));
+				}
+
+				destroy();
+
+				return accum.concat(doms);
+			});
+	})(fileList);
+}
+
 module.exports = (fotno) => {
+
+
+	fotno.registerCommand('xml-combinations')
+		.setDescription(`Show which attribute combinations are common.`)
+		.addOption('glob', 'g', 'Globbing pattern')
+		.addOption(new fotno.MultiOption('files').setShort('f').setDescription('The source files').isRequired(false))
+		.addOption(new fotno.MultiOption('attributes').setShort('a').setDescription('The attributes that are interesting').isRequired(true))
+		.addOption(new fotno.MultiOption('elements').setShort('e').setDescription('The elements that are interesting').isRequired(true))
+		.setController((req, res) => {
+			res.caption(`fotno xml-combinations`);
+
+			getDomsForRequest(req, res)
+				.then(doms => {
+
+					const elements = doms.reduce((elements, dom) => elements.concat(fontoxpath.evaluateXPathToNodes(
+						'//element()[name() = ("' + req.options.elements.join('", "') + '")]',
+						dom)), []);
+
+					const stats = elements.reduce((stats, element) => {
+						const attributeValues = req.options.attributes.map(name => element.getAttribute(name) || null);
+						const combinationId = JSON.stringify({ element: element.nodeName, attributes: attributeValues });
+
+						stats[combinationId] = (stats[combinationId] || 0) + 1;
+
+						return stats;
+					}, {});
+
+					const orderedStats = Object.keys(stats)
+						.map(info => Object.assign(JSON.parse(info), { occurrences: stats[info] }));
+
+					const table = new Table(fotno, [
+						{ name: '_el', default: true, label: 'Element', value: info => info.element },
+						{ name: '_occs', default: true, label: '#', value: info => info.occurrences },
+						...req.options.attributes.map((attr, i) => ({
+							name: attr,
+							default: true,
+							label: attr,
+							value: info => info.attributes[i]
+						}))
+					]);
+
+					table.print(
+						res,
+						table.columnsOption.default,
+						orderedStats,
+					'_occs');
+				});
+		});
+
 	fotno.registerCommand('xml-stats')
 		.setDescription(`Generates some quantitative statistics about an XML codebase.`)
 		.addOption('alphabetical', 'a', 'Sort stats alphabetically by element name')
@@ -27,53 +120,12 @@ module.exports = (fotno) => {
 		.addOption('hide-all', null, 'Hide all attributes')
 		.addOption('ignore-all', null, 'Ignore all attributes')
 		.setController((req, res) => {
-
-			const fileList = [
-				...req.options.files,
-				...(req.options.glob ? globby.sync([req.options.glob], { cwd: process.cwd(), absolute: true }) : [])
-			];
-
 			res.caption(`fotno xml-stats`);
 
-			let destroy = res.spinner('Reading ' + fileList.length + ' files');
-
-			// Read all files
-			return (function readNextBatch (fileList, accum = []) {
-					const slice = fileList.length > 100 ? fileList.slice(0, 100) : fileList;
-					const nextSlice = fileList.length > 100 ? fileList.slice(100) : [];
-
-					return Promise.all(slice.map(filename => {
-						return new Promise((resolve, reject) => fs.readFile(filename, 'utf8', (err, data) => {
-							if (err) {
-								res.notice(filename + ' could not be read: ' + err.message);
-								return resolve(false);
-							}
-							resolve(data);
-						}))
-					}))
-					.then(contents => {
-						const elegible = contents.filter(c => !!c);
-						return elegible.map(content => {
-							try {
-								return domParser.parseFromString(content, 'application/xml');
-							} catch(err) {
-								res.notice(filename + ' could not be parsed: ' + err.message);
-								return false;
-							}
-						})
-					})
-					.then(doms => {
-						if (nextSlice.length) {
-							return readNextBatch(nextSlice, accum.concat(doms));
-						}
-
-						return accum.concat(doms);
-					});
-				})(fileList)
+			let destroy = null;
+			getDomsForRequest(req, res)
 				.then(doms => {
 					const elegible = doms.filter(c => !!c);
-
-					destroy();
 					destroy = res.spinner('Counting elements in ' + elegible.length + ' files');
 
 					return doms.reduce((elements, dom) => elements.concat(fontoxpath.evaluateXPathToNodes('//element()', dom)), []);
