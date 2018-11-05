@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const child_process = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const globby = require('globby');
@@ -16,52 +17,79 @@ function percentage (ratio) {
 	return (Math.round(ratio * 10000) / 100) + '%';
 }
 
+const MAX_PER_BATCH = 1000;
+
 function getDomsForRequest (req, res) {
 	const fileList = [
 		...req.options.files,
 		...(req.options.glob ? globby.sync([req.options.glob], { cwd: process.cwd(), absolute: true }) : [])
 	];
-	const destroy = res.spinner('Reading ' + fileList.length + ' files');
+	let i = 0;
+	const total = Math.ceil(fileList.length / MAX_PER_BATCH);
 	// Read all files
 	return (function readNextBatch (fileList, accum = []) {
-		const slice = fileList.length > 100 ? fileList.slice(0, 100) : fileList;
-		const nextSlice = fileList.length > 100 ? fileList.slice(100) : [];
+		const slice = fileList.length > MAX_PER_BATCH ? fileList.slice(0, MAX_PER_BATCH) : fileList;
+		const nextSlice = fileList.length > MAX_PER_BATCH ? fileList.slice(MAX_PER_BATCH) : [];
 
-		return Promise.all(slice.map(filename => {
-			return new Promise((resolve, reject) => fs.readFile(filename, 'utf8', (err, data) => {
-				if (err) {
-					res.notice(filename + ' could not be read: ' + err.message);
-					return resolve(false);
-				}
-				resolve(data);
-			}))
-		}))
-			.then(contents => {
-				const elegible = contents.filter(c => !!c);
-				return elegible.map(content => {
-					try {
-						return domParser.parseFromString(content, 'application/xml');
-					} catch(err) {
-						res.notice(filename + ' could not be parsed: ' + err.message);
-						return false;
-					}
-				})
+		return new Promise(resolve => {
+				res.debug('Batch ' + (++i) + '/' + total);
+				const child = child_process.fork(path.resolve(__dirname, '..', 'child_process.js'));
+
+				child.on('message', message => {
+					child.send({
+						type: 'kill'
+					})
+
+					resolve(message);
+				});
+
+				child.send({
+					type: 'analyze',
+					fileList: slice
+				});
 			})
 			.then(doms => {
 				if (nextSlice.length) {
 					return readNextBatch(nextSlice, accum.concat(doms));
 				}
 
-				destroy();
-
 				return accum.concat(doms);
 			});
 	})(fileList);
 }
 
+function recursiveMergeChildProcessReults (destination, t) {
+	Object.keys(t).forEach(key => {
+		const value = t[key];
+
+		if (typeof value === 'string') {
+			return;
+		}
+
+		if (!destination[key]) {
+			destination[key] = value;
+			return;
+		}
+		if (typeof destination[key] !== typeof value) {
+			throw new Error('Type mismatch for key "' + key + '": ' + (typeof value) + ' to ' + (typeof destination[key]));
+		}
+		if (typeof value === 'object') {
+			destination[key] = recursiveMergeChildProcessReults(destination[key], value);
+			return;
+		}
+
+		if (typeof value === 'number') {
+			destination[key] = destination[key] + value;
+			return;
+		}
+
+		throw new Error('Unhandled type for key "' + key + '": ' + (typeof value));
+	});
+
+	return destination;
+}
+
 module.exports = (fotno) => {
-
-
 	fotno.registerCommand('xml-combinations')
 		.setDescription(`Show which attribute combinations are common.`)
 		.addOption('glob', 'g', 'Globbing pattern')
@@ -73,7 +101,6 @@ module.exports = (fotno) => {
 
 			getDomsForRequest(req, res)
 				.then(doms => {
-
 					const elements = doms.reduce((elements, dom) => elements.concat(fontoxpath.evaluateXPathToNodes(
 						'//element()[name() = ("' + req.options.elements.join('", "') + '")]',
 						dom)), []);
@@ -122,59 +149,13 @@ module.exports = (fotno) => {
 		.setController((req, res) => {
 			res.caption(`fotno xml-stats`);
 
-			let destroy = null;
 			getDomsForRequest(req, res)
 				.then(doms => {
-					const elegible = doms.filter(c => !!c);
-					destroy = res.spinner('Counting elements in ' + elegible.length + ' files');
-
-					return doms.reduce((elements, dom) => elements.concat(fontoxpath.evaluateXPathToNodes('//element()', dom)), []);
-				})
-
-				// Format a statistics object
-				.then(elements => {
-					destroy();
-					destroy = res.spinner('Concatenating statistics for ' + elements.length + ' elements');
-
-					return elements.reduce((elementsByName, element) => {
-							if (!elementsByName[element.nodeName])
-								elementsByName[element.nodeName] = {
-									$total: 0
-								};
-
-							++elementsByName[element.nodeName].$total;
-
-							const attributes = element.attributes
-								? Array.prototype.slice.call(element.attributes)
-								: [];
-
-							elementsByName.$totalAttributes += attributes.length;
-
-							attributes
-								.forEach(attr => {
-									if (!elementsByName[element.nodeName][attr.localName])
-										elementsByName[element.nodeName][attr.localName] = {
-											$total: 0
-										};
-
-									++elementsByName[element.nodeName][attr.localName].$total;
-
-									if (!elementsByName[element.nodeName][attr.localName][attr.nodeValue])
-										elementsByName[element.nodeName][attr.localName][attr.nodeValue] = 0;
-
-									++elementsByName[element.nodeName][attr.localName][attr.nodeValue];
-								});
-
-							return elementsByName;
-						}, {
-							$totalElements: elements.length,
-							$totalAttributes: 0
-						});
+					return doms.reduce((stats, stat) => recursiveMergeChildProcessReults(stats, stat), {});
 				})
 
 				// Do a fucktonne of formatting
 				.then(stats => {
-					destroy();
 					const elementStats = Object.keys(stats)
 						.filter(elementName => elementName.charAt(0) !== '$')
 						.map(elementName => Object.assign(stats[elementName], { $name: elementName }))
@@ -214,7 +195,7 @@ module.exports = (fotno) => {
 								res.indent();
 								const attributeValues = Object.keys(attrStat)
 									.filter(key => key.charAt(0) !== '$')
-									.map(key => [key, attrStat[key]])
+									.map(key => [key, attrStavalue])
 									.sort((a, b) => b[1] - a[1]);
 
 								attributeValues.slice(0, req.options['no-truncate'] ? attributeValues.length : truncateAttributeValueLength)
@@ -247,9 +228,6 @@ module.exports = (fotno) => {
 					], 'debug');
 				})
 				.catch(err => {
-					if (destroy) {
-						destroy();
-					}
 					throw err;
 				});
 		});
